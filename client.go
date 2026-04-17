@@ -1,6 +1,7 @@
 package rocketbot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -57,6 +58,22 @@ type Message struct {
 	Text     string
 	SenderID string
 	Raw      json.RawMessage
+}
+
+// AttachmentField is a table-like field in message attachment.
+type AttachmentField struct {
+	Title string `json:"title"`
+	Value string `json:"value"`
+	Short bool   `json:"short,omitempty"`
+}
+
+// Attachment is a rich Rocket.Chat message attachment.
+type Attachment struct {
+	Title  string            `json:"title,omitempty"`
+	Text   string            `json:"text,omitempty"`
+	Color  string            `json:"color,omitempty"`
+	Fields []AttachmentField `json:"fields,omitempty"`
+	Ts     time.Time         `json:"ts,omitempty"`
 }
 
 // Client is a DDP client for building Rocket.Chat bots.
@@ -213,6 +230,103 @@ func (c *Client) SendMessage(ctx context.Context, roomID, text string) error {
 		return fmt.Errorf("rocketbot: send message: %w", err)
 	}
 	return nil
+}
+
+// SendMessageWithAttachment sends a message with one attachment to room/channel.
+func (c *Client) SendMessageWithAttachment(ctx context.Context, roomID string, attachment Attachment) error {
+	return c.SendMessageWithAttachments(ctx, roomID, "", []Attachment{attachment})
+}
+
+// SendMessageWithAttachments sends a message with attachments to room/channel.
+func (c *Client) SendMessageWithAttachments(ctx context.Context, roomID, text string, attachments []Attachment) error {
+	if strings.TrimSpace(roomID) == "" {
+		return errors.New("rocketbot: roomID is required")
+	}
+	if strings.TrimSpace(text) == "" && len(attachments) == 0 {
+		return errors.New("rocketbot: text or attachments is required")
+	}
+
+	payload := map[string]any{
+		"roomId": roomID,
+		"text":   text,
+	}
+	if strings.TrimSpace(text) == "" {
+		payload["text"] = " "
+	}
+	if len(attachments) > 0 {
+		payload["attachments"] = toAPIAttachments(attachments)
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("rocketbot: marshal chat.postMessage payload: %w", err)
+	}
+
+	req, err := c.newAuthorizedRequest(ctx, http.MethodPost, "/api/v1/chat.postMessage")
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("rocketbot: request chat.postMessage: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	respText := strings.TrimSpace(string(respBody))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("rocketbot: chat.postMessage returned %s: %s", resp.Status, respText)
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return fmt.Errorf("rocketbot: decode chat.postMessage response: %w; body=%q", err, respText)
+	}
+	if !apiResp.Success {
+		return fmt.Errorf("rocketbot: chat.postMessage success=false: %s", respText)
+	}
+	return nil
+}
+
+func toAPIAttachments(attachments []Attachment) []map[string]any {
+	out := make([]map[string]any, 0, len(attachments))
+	for _, a := range attachments {
+		item := map[string]any{}
+		if strings.TrimSpace(a.Title) != "" {
+			item["title"] = a.Title
+		}
+		if strings.TrimSpace(a.Text) != "" {
+			item["text"] = a.Text
+		}
+		if strings.TrimSpace(a.Color) != "" {
+			item["color"] = a.Color
+		}
+		if len(a.Fields) > 0 {
+			fields := make([]map[string]any, 0, len(a.Fields))
+			for _, f := range a.Fields {
+				field := map[string]any{
+					"title": f.Title,
+					"value": f.Value,
+				}
+				if f.Short {
+					field["short"] = true
+				}
+				fields = append(fields, field)
+			}
+			item["fields"] = fields
+		}
+		if !a.Ts.IsZero() {
+			item["ts"] = a.Ts.UTC().Format(time.RFC3339)
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // ValidateAuth verifies X-User-Id and X-Auth-Token against /api/v1/me.
