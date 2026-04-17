@@ -118,7 +118,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	loginResult := struct {
 		ID      string `json:"id"`
 		Token   string `json:"token"`
-		TokenAt int64  `json:"tokenExpires"`
+		TokenAt any    `json:"tokenExpires"`
 	}{}
 
 	_, err = c.sendAndWait(ctx, ddpFrame{
@@ -261,8 +261,11 @@ func (c *Client) readLoop() {
 		case "ping":
 			_ = c.writeJSON(context.Background(), ddpFrame{Msg: "pong"})
 		case "connected":
-			c.resolvePending(frame.ID, frame)
-		case "result", "ready", "nosub":
+			// DDP "connected" frame usually has no id, so resolve the first pending request.
+			c.resolveFirstPending(frame)
+		case "ready":
+			c.resolvePendingBySubs(frame)
+		case "result", "nosub":
 			c.resolvePending(frame.ID, frame)
 		case "changed":
 			c.handleChanged(frame)
@@ -283,7 +286,7 @@ func (c *Client) handleChanged(frame ddpFrame) {
 		return
 	}
 
-	var event struct {
+	type roomEvent struct {
 		ID  string `json:"_id"`
 		RID string `json:"rid"`
 		Msg string `json:"msg"`
@@ -291,17 +294,43 @@ func (c *Client) handleChanged(frame ddpFrame) {
 			ID string `json:"_id"`
 		} `json:"u"`
 	}
-	if err := json.Unmarshal(payload[0], &event); err != nil {
+
+	parseEvent := func(raw json.RawMessage) (roomEvent, bool) {
+		var event roomEvent
+		if err := json.Unmarshal(raw, &event); err != nil {
+			return roomEvent{}, false
+		}
+		if strings.TrimSpace(event.RID) == "" || strings.TrimSpace(event.U.ID) == "" {
+			return roomEvent{}, false
+		}
+		return event, true
+	}
+
+	var event roomEvent
+	found := false
+	// Rocket.Chat can send different arg layouts for stream-room-messages;
+	// scan args and pick the first object that looks like a message event.
+	for _, candidate := range payload {
+		if ev, ok := parseEvent(candidate); ok {
+			event = ev
+			found = true
+			break
+		}
+	}
+	if !found {
 		return
 	}
 
-	c.onMessage(context.Background(), Message{
+	msg := Message{
 		ID:       event.ID,
 		RoomID:   event.RID,
 		Text:     event.Msg,
 		SenderID: event.U.ID,
 		Raw:      payload[0],
-	})
+	}
+	// Run user callback asynchronously so readLoop can keep processing
+	// DDP frames (including sendMessage "result" replies).
+	go c.onMessage(context.Background(), msg)
 }
 
 func (c *Client) resolvePending(id string, frame ddpFrame) {
@@ -315,6 +344,42 @@ func (c *Client) resolvePending(id string, frame ddpFrame) {
 	}
 	c.pendingMu.Unlock()
 	if ok {
+		ch <- frame
+	}
+}
+
+func (c *Client) resolveFirstPending(frame ddpFrame) {
+	c.pendingMu.Lock()
+	var (
+		firstID string
+		ch      chan ddpFrame
+	)
+	for id, pendingCh := range c.pending {
+		firstID = id
+		ch = pendingCh
+		break
+	}
+	if firstID != "" {
+		delete(c.pending, firstID)
+	}
+	c.pendingMu.Unlock()
+	if ch != nil {
+		ch <- frame
+	}
+}
+
+func (c *Client) resolvePendingBySubs(frame ddpFrame) {
+	c.pendingMu.Lock()
+	channels := make([]chan ddpFrame, 0, len(frame.Subs))
+	for _, subID := range frame.Subs {
+		if ch, ok := c.pending[subID]; ok {
+			delete(c.pending, subID)
+			channels = append(channels, ch)
+		}
+	}
+	c.pendingMu.Unlock()
+
+	for _, ch := range channels {
 		ch <- frame
 	}
 }
@@ -376,6 +441,7 @@ type ddpFrame struct {
 	Method     string          `json:"method,omitempty"`
 	Params     []any           `json:"params,omitempty"`
 	Name       string          `json:"name,omitempty"`
+	Subs       []string        `json:"subs,omitempty"`
 	Collection string          `json:"collection,omitempty"`
 	Fields     ddpFields       `json:"fields,omitempty"`
 	Result     json.RawMessage `json:"result,omitempty"`
