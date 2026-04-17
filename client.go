@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -33,6 +34,20 @@ type Config struct {
 
 	// Optional custom HTTP client used by websocket dialer.
 	HTTPClient *http.Client
+}
+
+// AutoSubscribeOptions controls background room auto-subscription.
+type AutoSubscribeOptions struct {
+	// Optional static room IDs to subscribe once on startup.
+	StaticRoomIDs []string
+	// Poll interval for discovering new room subscriptions.
+	Interval time.Duration
+	// Optional callback called for each successfully subscribed room id.
+	OnSubscribed func(roomID string)
+	// Optional callback for auto-subscribe/discovery errors.
+	OnError func(error)
+	// Optional callback after each discovery pass.
+	OnDiscovered func(roomCount int)
 }
 
 // Message represents a chat message event from Rocket.Chat stream-room-messages.
@@ -198,6 +213,169 @@ func (c *Client) SendMessage(ctx context.Context, roomID, text string) error {
 		return fmt.Errorf("rocketbot: send message: %w", err)
 	}
 	return nil
+}
+
+// ValidateAuth verifies X-User-Id and X-Auth-Token against /api/v1/me.
+func (c *Client) ValidateAuth(ctx context.Context) error {
+	req, err := c.newAuthorizedRequest(ctx, http.MethodGet, "/api/v1/me")
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("rocketbot: request /api/v1/me: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyText := strings.TrimSpace(string(body))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("rocketbot: /api/v1/me returned %s: %s", resp.Status, bodyText)
+	}
+	if bodyText == "" {
+		return errors.New("rocketbot: /api/v1/me returned empty response body")
+	}
+
+	var payload struct {
+		Success bool `json:"success"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return fmt.Errorf("rocketbot: decode /api/v1/me: %w; body=%q", err, bodyText)
+	}
+	if !payload.Success {
+		return fmt.Errorf("rocketbot: /api/v1/me returned success=false: %s", bodyText)
+	}
+	return nil
+}
+
+// ListSubscribedRoomIDs returns current room ids from /api/v1/subscriptions.get.
+func (c *Client) ListSubscribedRoomIDs(ctx context.Context) ([]string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := c.newAuthorizedRequest(reqCtx, http.MethodGet, "/api/v1/subscriptions.get")
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("rocketbot: request subscriptions: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("rocketbot: subscriptions request failed with status %s", resp.Status)
+	}
+
+	var payload struct {
+		Update []struct {
+			RID string `json:"rid"`
+		} `json:"update"`
+		Success bool `json:"success"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("rocketbot: decode subscriptions response: %w", err)
+	}
+	if !payload.Success {
+		return nil, errors.New("rocketbot: subscriptions response returned success=false")
+	}
+
+	roomIDs := make([]string, 0, len(payload.Update))
+	seen := make(map[string]struct{}, len(payload.Update))
+	for _, item := range payload.Update {
+		rid := strings.TrimSpace(item.RID)
+		if rid == "" {
+			continue
+		}
+		if _, ok := seen[rid]; ok {
+			continue
+		}
+		seen[rid] = struct{}{}
+		roomIDs = append(roomIDs, rid)
+	}
+	return roomIDs, nil
+}
+
+// StartAutoSubscribeRooms starts background room subscription management.
+func (c *Client) StartAutoSubscribeRooms(ctx context.Context, opts AutoSubscribeOptions) {
+	interval := opts.Interval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	subscribed := make(map[string]struct{})
+	var subscribedMu sync.Mutex
+
+	subscribeRooms := func(ids []string) {
+		for _, roomID := range ids {
+			roomID = strings.TrimSpace(roomID)
+			if roomID == "" {
+				continue
+			}
+
+			subscribedMu.Lock()
+			_, already := subscribed[roomID]
+			subscribedMu.Unlock()
+			if already {
+				continue
+			}
+
+			if err := c.SubscribeRoomMessages(ctx, roomID); err != nil {
+				if opts.OnError != nil {
+					opts.OnError(fmt.Errorf("subscribe failed for room %s: %w", roomID, err))
+				}
+				continue
+			}
+
+			subscribedMu.Lock()
+			subscribed[roomID] = struct{}{}
+			subscribedMu.Unlock()
+			if opts.OnSubscribed != nil {
+				opts.OnSubscribed(roomID)
+			}
+		}
+	}
+
+	go func() {
+		if len(opts.StaticRoomIDs) > 0 {
+			subscribeRooms(opts.StaticRoomIDs)
+		} else {
+			roomIDs, err := c.ListSubscribedRoomIDs(ctx)
+			if err != nil {
+				if opts.OnError != nil {
+					opts.OnError(fmt.Errorf("auto-discover failed: %w", err))
+				}
+			} else {
+				subscribeRooms(roomIDs)
+				if opts.OnDiscovered != nil {
+					opts.OnDiscovered(len(roomIDs))
+				}
+			}
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				roomIDs, err := c.ListSubscribedRoomIDs(ctx)
+				if err != nil {
+					if opts.OnError != nil {
+						opts.OnError(fmt.Errorf("room auto-discovery failed: %w", err))
+					}
+					continue
+				}
+				subscribeRooms(roomIDs)
+				if opts.OnDiscovered != nil {
+					opts.OnDiscovered(len(roomIDs))
+				}
+			}
+		}
+	}()
 }
 
 func (c *Client) sendAndWait(ctx context.Context, frame ddpFrame, resultTarget any) (ddpFrame, error) {
@@ -411,6 +589,28 @@ func (c *Client) writeJSON(ctx context.Context, frame ddpFrame) error {
 	defer cancel()
 
 	return conn.Write(writeCtx, websocket.MessageText, payload)
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.cfg.HTTPClient != nil {
+		return c.cfg.HTTPClient
+	}
+	return &http.Client{Timeout: 15 * time.Second}
+}
+
+func (c *Client) newAuthorizedRequest(ctx context.Context, method, endpoint string) (*http.Request, error) {
+	baseURL := strings.TrimRight(c.cfg.ServerURL, "/")
+	if baseURL == "" {
+		return nil, errors.New("rocketbot: ServerURL is required")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("rocketbot: build request %s: %w", endpoint, err)
+	}
+	req.Header.Set("X-User-Id", c.cfg.UserID)
+	req.Header.Set("X-Auth-Token", c.cfg.AuthToken)
+	req.Header.Set("Accept", "application/json")
+	return req, nil
 }
 
 func rocketWebSocketURL(serverURL string) (string, error) {
