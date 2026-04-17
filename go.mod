@@ -1,4 +1,4 @@
-module Rocket.chat-client
+module github.com/motylkov/Rocket.chat-client
 
 go 1.26
 

@@ -18,4 +18,3 @@ bot := rocketbot.NewClient(rocketbot.Config{
 	AuthToken: "your-bot-auth-token",
 })
 ```
-
