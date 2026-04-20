@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -74,6 +77,13 @@ type Attachment struct {
 	Color  string            `json:"color,omitempty"`
 	Fields []AttachmentField `json:"fields,omitempty"`
 	Ts     time.Time         `json:"ts,omitempty"`
+}
+
+// UploadResult contains parsed response of room file upload.
+type UploadResult struct {
+	MessageID string
+	FileURL   string
+	Raw       string
 }
 
 // Client is a DDP client for building Rocket.Chat bots.
@@ -292,6 +302,168 @@ func (c *Client) SendMessageWithAttachments(ctx context.Context, roomID, text st
 		return fmt.Errorf("rocketbot: chat.postMessage success=false: %s", respText)
 	}
 	return nil
+}
+
+// UploadRoomFile uploads a file to a room using REST API.
+// It tries /api/v1/rooms.upload first and falls back to /api/v1/rooms.media
+// for servers where the old route is unavailable.
+func (c *Client) UploadRoomFile(ctx context.Context, roomID, filePath, msg string) error {
+	_, err := c.UploadRoomFileDetailed(ctx, roomID, filePath, msg)
+	return err
+}
+
+// UploadRoomFileDetailed uploads file and returns parsed upload response.
+func (c *Client) UploadRoomFileDetailed(ctx context.Context, roomID, filePath, msg string) (UploadResult, error) {
+	if strings.TrimSpace(roomID) == "" {
+		return UploadResult{}, errors.New("rocketbot: roomID is required")
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return UploadResult{}, errors.New("rocketbot: filePath is required")
+	}
+
+	uploadOnce := func(endpoint string) (statusCode int, responseText string, err error) {
+		file, err := os.Open(filePath)
+		if err != nil {
+			return 0, "", fmt.Errorf("rocketbot: open file %q: %w", filePath, err)
+		}
+		defer file.Close()
+
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+
+		filePart, err := writer.CreateFormFile("file", filepath.Base(filePath))
+		if err != nil {
+			return 0, "", fmt.Errorf("rocketbot: create multipart file part: %w", err)
+		}
+		if _, err := io.Copy(filePart, file); err != nil {
+			return 0, "", fmt.Errorf("rocketbot: write file to multipart body: %w", err)
+		}
+		if strings.TrimSpace(msg) != "" {
+			if err := writer.WriteField("msg", msg); err != nil {
+				return 0, "", fmt.Errorf("rocketbot: write multipart msg field: %w", err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			return 0, "", fmt.Errorf("rocketbot: close multipart writer: %w", err)
+		}
+
+		req, err := c.newAuthorizedRequest(ctx, http.MethodPost, endpoint+roomID)
+		if err != nil {
+			return 0, "", err
+		}
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
+		req.ContentLength = int64(body.Len())
+
+		resp, err := c.httpClient().Do(req)
+		if err != nil {
+			return 0, "", fmt.Errorf("rocketbot: upload request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		respBody, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, strings.TrimSpace(string(respBody)), nil
+	}
+
+	statusCode, responseText, err := uploadOnce("/api/v1/rooms.upload/")
+	if err != nil {
+		return UploadResult{}, err
+	}
+	if statusCode == http.StatusNotFound {
+		statusCode, responseText, err = uploadOnce("/api/v1/rooms.media/")
+		if err != nil {
+			return UploadResult{}, err
+		}
+	}
+	if statusCode != http.StatusOK {
+		return UploadResult{}, fmt.Errorf("rocketbot: upload failed with status %d: %s", statusCode, responseText)
+	}
+	var apiResp struct {
+		Success bool `json:"success"`
+		Message struct {
+			ID string `json:"_id"`
+		} `json:"message"`
+		File struct {
+			URL string `json:"url"`
+		} `json:"file"`
+	}
+	if err := json.Unmarshal([]byte(responseText), &apiResp); err != nil {
+		return UploadResult{}, fmt.Errorf("rocketbot: upload returned non-json response: %q", responseText)
+	}
+	if !apiResp.Success {
+		return UploadResult{}, fmt.Errorf("rocketbot: upload returned success=false: %s", responseText)
+	}
+	fileURL := strings.TrimSpace(apiResp.File.URL)
+	if fileURL != "" && strings.HasPrefix(fileURL, "/") {
+		fileURL = strings.TrimRight(c.cfg.ServerURL, "/") + fileURL
+	}
+	messageID := strings.TrimSpace(apiResp.Message.ID)
+	// Some Rocket.Chat versions upload file successfully but do not create message.
+	// In that case publish a message with attachment image_url explicitly.
+	if messageID == "" && fileURL != "" {
+		id, err := c.sendImageURLMessage(ctx, roomID, fileURL, msg)
+		if err != nil {
+			return UploadResult{}, err
+		}
+		messageID = id
+	}
+	return UploadResult{
+		MessageID: messageID,
+		FileURL:   fileURL,
+		Raw:       responseText,
+	}, nil
+}
+
+func (c *Client) sendImageURLMessage(ctx context.Context, roomID, imageURL, text string) (string, error) {
+	payload := map[string]any{
+		"roomId": roomID,
+		"text":   text,
+		"attachments": []map[string]any{
+			{
+				"image_url": imageURL,
+			},
+		},
+	}
+	if strings.TrimSpace(text) == "" {
+		payload["text"] = " "
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("rocketbot: marshal image_url post payload: %w", err)
+	}
+	req, err := c.newAuthorizedRequest(ctx, http.MethodPost, "/api/v1/chat.postMessage")
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("rocketbot: request chat.postMessage for image: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	respText := strings.TrimSpace(string(respBody))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("rocketbot: chat.postMessage(image_url) returned %s: %s", resp.Status, respText)
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Message struct {
+			ID string `json:"_id"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return "", fmt.Errorf("rocketbot: decode chat.postMessage(image_url) response: %w; body=%q", err, respText)
+	}
+	if !apiResp.Success {
+		return "", fmt.Errorf("rocketbot: chat.postMessage(image_url) success=false: %s", respText)
+	}
+	return strings.TrimSpace(apiResp.Message.ID), nil
 }
 
 func toAPIAttachments(attachments []Attachment) []map[string]any {
